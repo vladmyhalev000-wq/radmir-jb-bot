@@ -54,19 +54,24 @@ def fetch(url):
 def parse_relative_time(text):
     now = datetime.now()
     text = " ".join(text.split())
+
     m = re.search(r"(\d+)\s*мин", text)
     if m:
         return now - timedelta(minutes=int(m.group(1)))
+
     m = re.search(r"(\d+)\s*ч", text)
     if m:
         return now - timedelta(hours=int(m.group(1)))
+
     m = re.search(r"Сегодня в\s*(\d{1,2}):(\d{2})", text)
     if m:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+
     m = re.search(r"Вчера в\s*(\d{1,2}):(\d{2})", text)
     if m:
         d = now - timedelta(days=1)
         return d.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+
     m = re.search(r"(\d{1,2})\s+([А-Яа-я]+)\s+(\d{4})", text)
     months = {"янв":1,"фев":2,"мар":3,"апр":4,"мая":5,"май":5,"июн":6,"июл":7,"авг":8,"сен":9,"окт":10,"ноя":11,"дек":12}
     if m:
@@ -74,7 +79,16 @@ def parse_relative_time(text):
         for k, v in months.items():
             if mon_txt.startswith(k):
                 return datetime(year, v, day)
+
     return None
+
+def format_left(base_time):
+    left = timedelta(hours=24) - (datetime.now() - base_time)
+    total_minutes = int(left.total_seconds() // 60)
+    if total_minutes <= 0:
+        overdue = abs(total_minutes)
+        return f"🚨 ПРОСРОК уже {overdue // 60}ч {overdue % 60}м"
+    return f"⏳ До просрока: {total_minutes // 60}ч {total_minutes % 60}м"
 
 def get_pages():
     urls = [FORUM_URL]
@@ -115,6 +129,33 @@ def get_last_admin_answer_time(topic_url):
                 times.append(dt)
     return max(times) if times else None
 
+def collect_complaints():
+    complaints = []
+    for page in get_pages():
+        try:
+            topics = parse_forum_page(fetch(page))
+        except Exception as e:
+            logging.exception("Forum page error %s: %s", page, e)
+            continue
+
+        for t in topics:
+            try:
+                last_admin = get_last_admin_answer_time(t["url"])
+                base_time = last_admin or t["created_at"]
+                if not base_time:
+                    continue
+                complaints.append({
+                    "title": t["title"],
+                    "url": t["url"],
+                    "base_time": base_time,
+                    "from_admin": bool(last_admin)
+                })
+            except Exception as e:
+                logging.exception("Topic error %s: %s", t.get("url"), e)
+
+    complaints.sort(key=lambda x: x["base_time"])
+    return complaints
+
 async def notify(text):
     if bot:
         await bot.send_message(TELEGRAM_ID, text, disable_web_page_preview=True)
@@ -122,46 +163,38 @@ async def notify(text):
 async def check_once():
     conn = db()
     cur = conn.cursor()
-    all_topics = []
-    for page in get_pages():
-        try:
-            all_topics.extend(parse_forum_page(fetch(page)))
-        except Exception as e:
-            logging.exception("Forum page error %s: %s", page, e)
 
-    for t in all_topics:
-        try:
-            last_admin = get_last_admin_answer_time(t["url"])
-            base_time = last_admin or t["created_at"]
-            if not base_time:
-                continue
+    for c in collect_complaints():
+        base_time = c["base_time"]
+        base_iso = base_time.isoformat(timespec="seconds")
 
-            base_iso = base_time.isoformat(timespec="seconds")
-            cur.execute("SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics WHERE url=?", (t["url"],))
-            row = cur.fetchone()
-            if not row:
+        cur.execute("SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics WHERE url=?", (c["url"],))
+        row = cur.fetchone()
+
+        if not row:
+            sent_22 = sent_23 = sent_24 = 0
+            cur.execute("INSERT INTO topics(url,title,last_base_time,sent_22,sent_23,sent_24) VALUES(?,?,?,?,?,?)", (c["url"], c["title"], base_iso, 0, 0, 0))
+        else:
+            old_base, sent_22, sent_23, sent_24 = row
+            if old_base != base_iso:
                 sent_22 = sent_23 = sent_24 = 0
-                cur.execute("INSERT INTO topics(url,title,last_base_time,sent_22,sent_23,sent_24) VALUES(?,?,?,?,?,?)", (t["url"], t["title"], base_iso, 0, 0, 0))
-            else:
-                old_base, sent_22, sent_23, sent_24 = row
-                if old_base != base_iso:
-                    sent_22 = sent_23 = sent_24 = 0
-                    cur.execute("UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 WHERE url=?", (t["title"], base_iso, t["url"]))
-            conn.commit()
+                cur.execute("UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 WHERE url=?", (c["title"], base_iso, c["url"]))
 
-            hours = (datetime.now() - base_time).total_seconds() / 3600
-            if hours >= 24 and not sent_24:
-                await notify(f"🚨 ЖБ просрочена:\n{t['title']}\n{t['url']}")
-                cur.execute("UPDATE topics SET sent_24=1 WHERE url=?", (t["url"],))
-            elif hours >= 23 and not sent_23:
-                await notify(f"⚠️ Через 1 час просрок ЖБ:\n{t['title']}\n{t['url']}")
-                cur.execute("UPDATE topics SET sent_23=1 WHERE url=?", (t["url"],))
-            elif hours >= 22 and not sent_22:
-                await notify(f"⚠️ Через 2 часа просрок ЖБ:\n{t['title']}\n{t['url']}")
-                cur.execute("UPDATE topics SET sent_22=1 WHERE url=?", (t["url"],))
-            conn.commit()
-        except Exception as e:
-            logging.exception("Topic error %s: %s", t.get("url"), e)
+        conn.commit()
+        hours = (datetime.now() - base_time).total_seconds() / 3600
+
+        if hours >= 24 and not sent_24:
+            await notify(f"🚨 ЖБ просрочена:\n{c['title']}\n{c['url']}")
+            cur.execute("UPDATE topics SET sent_24=1 WHERE url=?", (c["url"],))
+        elif hours >= 23 and not sent_23:
+            await notify(f"⚠️ Через 1 час просрок ЖБ:\n{c['title']}\n{c['url']}")
+            cur.execute("UPDATE topics SET sent_23=1 WHERE url=?", (c["url"],))
+        elif hours >= 22 and not sent_22:
+            await notify(f"⚠️ Через 2 часа просрок ЖБ:\n{c['title']}\n{c['url']}")
+            cur.execute("UPDATE topics SET sent_22=1 WHERE url=?", (c["url"],))
+
+        conn.commit()
+
     conn.close()
 
 async def checker_loop():
@@ -172,13 +205,42 @@ async def checker_loop():
 @dp.message()
 async def commands(message: types.Message):
     if message.text == "/start":
-        await message.answer("Бот работает. Я буду присылать просроки ЖБ.")
-    elif message.text == "/check":
+        await message.answer("Бот работает. Команды: /check, /list, /id")
+        return
+
+    if message.text == "/check":
         await message.answer("Проверяю форум...")
         await check_once()
         await message.answer("Проверка завершена.")
-    elif message.text == "/id":
+        return
+
+    if message.text == "/list":
+        await message.answer("Собираю список ЖБ...")
+        complaints = collect_complaints()
+
+        if not complaints:
+            await message.answer("Жалоб в рассмотрении не найдено.")
+            return
+
+        parts = ["📋 Жалобы в рассмотрении:"]
+        for i, c in enumerate(complaints[:20], start=1):
+            source = "от последнего ответа админа" if c["from_admin"] else "от создания темы"
+            parts.append(
+                f"\n{i}. {c['title']}\n"
+                f"{format_left(c['base_time'])}\n"
+                f"Счёт: {source}\n"
+                f"{c['url']}"
+            )
+
+        if len(complaints) > 20:
+            parts.append(f"\nПоказаны первые 20 из {len(complaints)}.")
+
+        await message.answer("\n".join(parts), disable_web_page_preview=True)
+        return
+
+    if message.text == "/id":
         await message.answer(str(message.chat.id))
+        return
 
 async def handle_ping(request):
     return web.Response(text="OK")
@@ -186,13 +248,16 @@ async def handle_ping(request):
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Add it in Render Environment.")
+
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
+
     port = int(os.getenv("PORT", "10000"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+
     asyncio.create_task(checker_loop())
     await dp.start_polling(bot)
 
