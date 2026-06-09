@@ -380,6 +380,26 @@ async def checker_loop():
         await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 
+def build_complaints_message(complaints):
+    if not complaints:
+        return "Жалоб в рассмотрении не найдено."
+
+    parts = ["📋 Жалобы в рассмотрении:"]
+    for i, c in enumerate(complaints[:20], start=1):
+        source = "от последнего ответа админа" if c["from_admin"] else "от создания темы"
+        parts.append(
+            f"\n{i}. {c['title']}\n"
+            f"{format_left(c['base_time'])}\n"
+            f"Счёт: {source}\n"
+            f"{c['url']}"
+        )
+
+    if len(complaints) > 20:
+        parts.append(f"\nПоказаны первые 20 из {len(complaints)}.")
+
+    return "\n".join(parts)
+
+
 @dp.message()
 async def commands(message: types.Message):
     if message.text == "/start":
@@ -388,29 +408,15 @@ async def commands(message: types.Message):
 
     if message.text == "/check":
         await message.answer("Проверяю форум...")
+        complaints, _ = await collect_complaints_async()
+        await message.answer(build_complaints_message(complaints), disable_web_page_preview=True)
         await check_once()
-        await message.answer("Проверка завершена.")
         return
 
     if message.text == "/list":
         await message.answer("Собираю список ЖБ...")
         complaints, _ = await collect_complaints_async()
-
-        if not complaints:
-            await message.answer("Жалоб в рассмотрении не найдено.")
-            return
-
-        parts = ["📋 Жалобы в рассмотрении:"]
-        for i, c in enumerate(complaints[:20], start=1):
-            source = "от последнего ответа админа" if c["from_admin"] else "от создания темы"
-            parts.append(
-                f"\n{i}. {c['title']}\n"
-                f"{format_left(c['base_time'])}\n"
-                f"Счёт: {source}\n"
-                f"{c['url']}"
-            )
-
-        await message.answer("\n".join(parts), disable_web_page_preview=True)
+        await message.answer(build_complaints_message(complaints), disable_web_page_preview=True)
         return
 
     if message.text in ("/debug", "/scan"):
