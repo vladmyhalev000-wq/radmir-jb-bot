@@ -60,6 +60,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 DB_PATH = "bot.db"
+CHECK_LOCK = asyncio.Lock()
 
 
 def db():
@@ -355,16 +356,6 @@ async def collect_complaints_async(section_key):
             viewport={"width": 1280, "height": 720},
         )
 
-        try:
-            await page.route(
-                "**/*",
-                lambda route: route.abort()
-                if route.request.resource_type in ("image", "media", "font", "stylesheet")
-                else route.continue_()
-            )
-        except Exception:
-            pass
-
         for n in range(1, PAGES_TO_CHECK + 1):
             try:
                 html = await get_html(page, forum_page_url(section_key, n))
@@ -375,9 +366,8 @@ async def collect_complaints_async(section_key):
             except Exception as e:
                 logging.exception("Forum page error: %s", e)
 
-        # LOW MEMORY MODE:
-        # Не открываем каждую тему отдельно, чтобы Render Free не падал по памяти.
-        # Берём время и ссылку прямо со списка раздела.
+        # Лёгкий режим: не открываем каждую тему, берём данные со списка раздела.
+        # Так Render Free не падает по памяти.
         for t in list(seen.values())[:MAX_TOPICS]:
             if t.get("created_at"):
                 complaints.append({
@@ -539,7 +529,12 @@ def unique_checks():
 async def check_all_users():
     for user_id, section_key in unique_checks():
         try:
-            await check_section_for_user(user_id, section_key)
+            if CHECK_LOCK.locked():
+                logging.info("Skip auto check because manual/other check is running")
+                await asyncio.sleep(SECTION_DELAY_SECONDS)
+                continue
+            async with CHECK_LOCK:
+                await check_section_for_user(user_id, section_key)
         except Exception as e:
             logging.exception("Auto check error user=%s section=%s: %s", user_id, section_key, e)
 
@@ -617,14 +612,24 @@ async def callbacks(call: CallbackQuery):
 
     if action == "list":
         await call.message.answer(f"Проверяю раздел: {SECTIONS[section_key]['name']}...")
-        complaints, _ = await collect_complaints_async(section_key)
+        if CHECK_LOCK.locked():
+            await call.message.answer("Подожди, уже идёт проверка другого раздела. Попробуй через 30-60 секунд.")
+            await call.answer()
+            return
+        async with CHECK_LOCK:
+            complaints, _ = await collect_complaints_async(section_key)
         await call.message.answer(build_complaints_message(section_key, complaints), disable_web_page_preview=True)
         await call.answer()
         return
 
     if action == "debug":
         await call.message.answer(f"Debug раздела: {SECTIONS[section_key]['name']}...")
-        complaints, topics = await collect_complaints_async(section_key)
+        if CHECK_LOCK.locked():
+            await call.message.answer("Подожди, уже идёт проверка другого раздела. Попробуй через 30-60 секунд.")
+            await call.answer()
+            return
+        async with CHECK_LOCK:
+            complaints, topics = await collect_complaints_async(section_key)
 
         if not topics:
             await call.message.answer("Debug: тем не вижу. Возможно, форум долго грузится или блокирует Render.")
