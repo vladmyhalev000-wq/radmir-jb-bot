@@ -112,8 +112,16 @@ def clean_title(title):
 
 
 async def get_html(page, url):
-    await page.goto(url, wait_until="networkidle", timeout=60000)
-    await page.wait_for_timeout(1500)
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await page.wait_for_timeout(3000)
+
+    for _ in range(3):
+        try:
+            return await page.content()
+        except Exception:
+            await page.wait_for_timeout(2000)
+
     return await page.content()
 
 
