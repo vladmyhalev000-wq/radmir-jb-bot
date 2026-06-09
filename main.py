@@ -18,6 +18,13 @@ PAGES_TO_CHECK = int(os.getenv("PAGES_TO_CHECK", "1"))
 MAX_TOPICS = int(os.getenv("MAX_TOPICS", "20"))
 
 CLOSED_PREFIXES = ("ОДОБРЕНО", "ОТКАЗАНО")
+
+IGNORE_TITLE_PARTS = (
+    "Правила подачи",
+    "Правила запроса опровержений",
+    "ИНФОРМАЦИЯ",
+)
+
 ADMIN_WORDS = ("Администратор", "Главный администратор", "Зам. главного администратора", "SERVER 06")
 
 # Разделы форума.
@@ -66,6 +73,11 @@ def db():
     """)
     conn.commit()
     return conn
+
+
+def should_ignore_title(title: str) -> bool:
+    title_lower = title.lower()
+    return any(part.lower() in title_lower for part in IGNORE_TITLE_PARTS)
 
 
 def parse_relative_time(text):
@@ -182,12 +194,8 @@ def parse_forum_html(html):
         title = clean_title(a.get_text(" ", strip=True))
         href = a.get("href", "")
 
-        if (
-            not title 
-            or "Правила подачи" in title
-            or "Правила запроса опровержений" in title
-):
-           continue
+        if not title or should_ignore_title(title):
+            continue
 
         url = make_absolute_url(href)
         topics[url] = {
@@ -201,14 +209,10 @@ def parse_forum_html(html):
             title = clean_title(a.get_text(" ", strip=True))
             href = a.get("href", "")
 
-            if (
-                not title 
-                or "Правила подачи" in title
-                or "Правила запроса опровержений" in title
-            ):
+            if not title or should_ignore_title(title):
                 continue
 
-             parent = a
+            parent = a
             for _ in range(8):
                 parent = parent.parent
                 if not parent:
@@ -263,6 +267,9 @@ def parse_topic_html(html, fallback_title, url):
 
     h = soup.select_one("h1, .p-title-value")
     title = clean_title(h.get_text(" ", strip=True)) if h else fallback_title
+
+    if should_ignore_title(title):
+        return None
 
     admin_times = []
     all_times = []
