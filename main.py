@@ -63,6 +63,9 @@ def parse_relative_time(text):
     if m:
         return now - timedelta(hours=int(m.group(1)))
 
+    if "Только что" in text:
+        return now
+
     m = re.search(r"Сегодня в\s*(\d{1,2}):(\d{2})", text)
     if m:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
@@ -96,22 +99,57 @@ def get_pages():
         urls.append(FORUM_URL.rstrip("/") + f"/page-{p}")
     return urls
 
+def closest_thread_row(a):
+    row = a.find_parent(class_=re.compile(r"structItem"))
+    if row:
+        return row
+
+    row = a.find_parent(["article", "li"])
+    if row:
+        return row
+
+    # fallback: небольшой родитель, но не весь список форума
+    p = a
+    for _ in range(6):
+        p = p.parent
+        if not p:
+            break
+        txt = p.get_text(" ", strip=True)
+        if "Ответы:" in txt and "Просмотры:" in txt:
+            return p
+    return None
+
 def parse_forum_page(html):
     soup = BeautifulSoup(html, "html.parser")
     topics = {}
+
     for a in soup.select('a[href*="/threads/"]'):
-        title = a.get_text(" ", strip=True)
         href = a.get("href", "")
+        title = a.get_text(" ", strip=True)
+
         if not title or "/threads/" not in href:
             continue
-        row = a.find_parent(["div", "li", "article"])
+        if title.lower() in ("вперёд", "назад"):
+            continue
+        if "Правила подачи" in title:
+            continue
+
+        row = closest_thread_row(a)
         if not row:
             continue
-        row_text = row.get_text(" ", strip=True)
-        if any(prefix in row_text.upper() for prefix in CLOSED_PREFIXES):
+
+        row_text = row.get_text(" ", strip=True).upper()
+
+        # пропускаем только если закрытый префикс в этой конкретной строке темы
+        if any(prefix in row_text for prefix in CLOSED_PREFIXES):
             continue
+
+        # обычные темы/в рассмотрении оставляем
         url = urljoin(FORUM_URL, href.split("?")[0])
-        topics[url] = {"title": title, "url": url, "created_at": parse_relative_time(row_text)}
+        created_at = parse_relative_time(row.get_text(" ", strip=True))
+
+        topics[url] = {"title": title, "url": url, "created_at": created_at}
+
     return list(topics.values())
 
 def is_admin_message(block):
@@ -122,15 +160,18 @@ def get_last_admin_answer_time(topic_url):
     html = fetch(topic_url)
     soup = BeautifulSoup(html, "html.parser")
     times = []
+
     for msg in soup.select("article.message, .message"):
         if is_admin_message(msg):
             dt = parse_relative_time(msg.get_text(" ", strip=True))
             if dt:
                 times.append(dt)
+
     return max(times) if times else None
 
 def collect_complaints():
     complaints = []
+
     for page in get_pages():
         try:
             topics = parse_forum_page(fetch(page))
@@ -144,6 +185,7 @@ def collect_complaints():
                 base_time = last_admin or t["created_at"]
                 if not base_time:
                     continue
+
                 complaints.append({
                     "title": t["title"],
                     "url": t["url"],
