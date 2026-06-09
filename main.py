@@ -182,8 +182,12 @@ def parse_forum_html(html):
         title = clean_title(a.get_text(" ", strip=True))
         href = a.get("href", "")
 
-        if not title or "Правила подачи" in title:
-            continue
+       if (
+    not title
+    or "Правила подачи" in title
+    or "Правила запроса опровержений" in title
+):
+    continue
 
         url = make_absolute_url(href)
         topics[url] = {
@@ -197,8 +201,12 @@ def parse_forum_html(html):
             title = clean_title(a.get_text(" ", strip=True))
             href = a.get("href", "")
 
-            if not title or "Правила подачи" in title:
-                continue
+            if (
+    not title
+    or "Правила подачи" in title
+    or "Правила запроса опровержений" in title
+):
+    continue
 
             parent = a
             for _ in range(8):
