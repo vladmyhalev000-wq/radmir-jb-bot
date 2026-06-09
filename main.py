@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import sqlite3
 import asyncio
 import logging
@@ -13,9 +14,12 @@ from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
+CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 PAGES_TO_CHECK = int(os.getenv("PAGES_TO_CHECK", "1"))
-MAX_TOPICS = int(os.getenv("MAX_TOPICS", "20"))
+MAX_TOPICS = int(os.getenv("MAX_TOPICS", "5"))
+
+# Пауза между проверками разделов, чтобы Render Free не умирал по памяти.
+SECTION_DELAY_SECONDS = int(os.getenv("SECTION_DELAY_SECONDS", "10"))
 
 CLOSED_PREFIXES = ("ОДОБРЕНО", "ОТКАЗАНО")
 
@@ -25,9 +29,13 @@ IGNORE_TITLE_PARTS = (
     "ИНФОРМАЦИЯ",
 )
 
-ADMIN_WORDS = ("Администратор", "Главный администратор", "Зам. главного администратора", "SERVER 06")
+ADMIN_WORDS = (
+    "Администратор",
+    "Главный администратор",
+    "Зам. главного администратора",
+    "SERVER 06",
+)
 
-# Разделы форума.
 SECTIONS = {
     "ne_sost": {
         "name": "ЖБ на не сост",
@@ -43,8 +51,6 @@ SECTIONS = {
     },
 }
 
-# Кому какие разделы присылать автоматически.
-# Тебе пока оставил все 3 раздела. Если хочешь только "не сост" — убери остальные ключи.
 USER_SECTIONS = {
     5952642946: ["ne_sost", "oprova_crime", "mafia_bands"],
     1819044320: ["oprova_crime", "mafia_bands"],
@@ -105,7 +111,11 @@ def parse_relative_time(text):
         return d.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
 
     m = re.search(r"(\d{1,2})\s+([А-Яа-я]+)\s+(\d{4})(?:\s*в\s*(\d{1,2}):(\d{2}))?", text)
-    months = {"янв":1,"фев":2,"мар":3,"апр":4,"мая":5,"май":5,"июн":6,"июл":7,"авг":8,"сен":9,"окт":10,"ноя":11,"дек":12}
+    months = {
+        "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6,
+        "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12
+    }
+
     if m:
         day = int(m.group(1))
         mon_txt = m.group(2).lower()
@@ -133,8 +143,10 @@ def format_left(base_time):
 
 def forum_page_url(section_key, page_num):
     base_url = SECTIONS[section_key]["url"]
+
     if page_num <= 1:
         return base_url
+
     return base_url.rstrip("/") + f"/page-{page_num}"
 
 
@@ -146,17 +158,19 @@ def clean_title(title):
 
 async def get_html(page, url):
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
     try:
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    await page.wait_for_timeout(3000)
+
+    await page.wait_for_timeout(2000)
 
     for _ in range(3):
         try:
             return await page.content()
         except Exception:
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1500)
 
     return await page.content()
 
@@ -171,8 +185,10 @@ def make_absolute_url(href):
 
     url = url.split("?")[0].rstrip("/")
     m = re.search(r"(\d+)$", url)
+
     if m:
         return "https://forum.radmir.games/threads/" + m.group(1)
+
     return url
 
 
@@ -188,6 +204,7 @@ def parse_forum_html(html):
             continue
 
         a = row.select_one('a[href*="/threads/"]')
+
         if not a:
             continue
 
@@ -213,11 +230,15 @@ def parse_forum_html(html):
                 continue
 
             parent = a
+
             for _ in range(8):
                 parent = parent.parent
+
                 if not parent:
                     break
+
                 txt = parent.get_text(" ", strip=True)
+
                 if "Ответы:" in txt and "Просмотры:" in txt:
                     if any(p in txt.upper() for p in CLOSED_PREFIXES):
                         break
@@ -245,6 +266,7 @@ def is_admin_message(block):
 
 def message_time(block):
     time_el = block.select_one("time")
+
     if time_el:
         if time_el.get("data-time"):
             try:
@@ -253,6 +275,7 @@ def message_time(block):
                 pass
 
         dt = parse_relative_time(time_el.get_text(" ", strip=True))
+
         if dt:
             return dt
 
@@ -276,6 +299,7 @@ def parse_topic_html(html, fallback_title, url):
 
     for msg in soup.select("article.message, .message"):
         dt = message_time(msg)
+
         if dt:
             all_times.append(dt)
 
@@ -305,12 +329,22 @@ async def collect_complaints_async(section_key):
     complaints = []
     seen = {}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    logging.info("Collect section started: %s", section_key)
+
+    playwright = await async_playwright().start()
+    browser = None
+
+    try:
+        browser = await playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
                 "--disable-blink-features=AutomationControlled",
             ],
         )
@@ -318,14 +352,26 @@ async def collect_complaints_async(section_key):
         page = await browser.new_page(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36",
             locale="ru-RU",
-            viewport={"width": 1366, "height": 768},
+            viewport={"width": 1280, "height": 720},
         )
+
+        try:
+            await page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font", "stylesheet")
+                else route.continue_()
+            )
+        except Exception:
+            pass
 
         for n in range(1, PAGES_TO_CHECK + 1):
             try:
                 html = await get_html(page, forum_page_url(section_key, n))
+
                 for t in parse_forum_html(html):
                     seen[t["url"]] = t
+
             except Exception as e:
                 logging.exception("Forum page error: %s", e)
 
@@ -333,6 +379,7 @@ async def collect_complaints_async(section_key):
             try:
                 html = await get_html(page, t["url"])
                 info = parse_topic_html(html, t["title"], t["url"])
+
                 if info:
                     complaints.append(info)
                 elif t.get("created_at"):
@@ -342,8 +389,10 @@ async def collect_complaints_async(section_key):
                         "base_time": t["created_at"],
                         "from_admin": False,
                     })
+
             except Exception as e:
                 logging.exception("Topic error %s: %s", t.get("url"), e)
+
                 if t.get("created_at"):
                     complaints.append({
                         "title": t["title"],
@@ -352,9 +401,27 @@ async def collect_complaints_async(section_key):
                         "from_admin": False,
                     })
 
-        await browser.close()
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+
+        gc.collect()
 
     complaints.sort(key=lambda x: x["base_time"])
+    logging.info("Collect section finished: %s, topics=%s, complaints=%s", section_key, len(seen), len(complaints))
     return complaints, list(seen.values())
 
 
@@ -365,8 +432,10 @@ def build_complaints_message(section_key, complaints):
         return f"📂 {section_name}\n\nЖалоб в рассмотрении не найдено."
 
     parts = [f"📂 {section_name}\n📋 Жалобы в рассмотрении:"]
+
     for i, c in enumerate(complaints[:20], start=1):
         source = "от последнего ответа админа" if c["from_admin"] else "от создания темы"
+
         parts.append(
             f"\n{i}. {c['title']}\n"
             f"{format_left(c['base_time'])}\n"
@@ -382,8 +451,15 @@ def build_complaints_message(section_key, complaints):
 
 def sections_keyboard(prefix):
     buttons = []
+
     for key, section in SECTIONS.items():
-        buttons.append([InlineKeyboardButton(text=section["name"], callback_data=f"{prefix}:{key}")])
+        buttons.append([
+            InlineKeyboardButton(
+                text=section["name"],
+                callback_data=f"{prefix}:{key}",
+            )
+        ])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -404,7 +480,8 @@ async def check_section_for_user(user_id, section_key):
         base_iso = base_time.isoformat(timespec="seconds")
 
         cur.execute(
-            "SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics WHERE section_key=? AND user_id=? AND url=?",
+            "SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics "
+            "WHERE section_key=? AND user_id=? AND url=?",
             (section_key, user_id, c["url"]),
         )
         row = cur.fetchone()
@@ -412,15 +489,18 @@ async def check_section_for_user(user_id, section_key):
         if not row:
             sent_22 = sent_23 = sent_24 = 0
             cur.execute(
-                "INSERT INTO topics(section_key,user_id,url,title,last_base_time,sent_22,sent_23,sent_24) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO topics(section_key,user_id,url,title,last_base_time,sent_22,sent_23,sent_24) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (section_key, user_id, c["url"], c["title"], base_iso, 0, 0, 0),
             )
         else:
             old_base, sent_22, sent_23, sent_24 = row
+
             if old_base != base_iso:
                 sent_22 = sent_23 = sent_24 = 0
                 cur.execute(
-                    "UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 WHERE section_key=? AND user_id=? AND url=?",
+                    "UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 "
+                    "WHERE section_key=? AND user_id=? AND url=?",
                     (c["title"], base_iso, section_key, user_id, c["url"]),
                 )
 
@@ -433,12 +513,14 @@ async def check_section_for_user(user_id, section_key):
                 "UPDATE topics SET sent_24=1 WHERE section_key=? AND user_id=? AND url=?",
                 (section_key, user_id, c["url"]),
             )
+
         elif hours >= 23 and not sent_23:
             await notify(user_id, f"⚠️ Через 1 час просрок ЖБ\n📂 {section_name}\n\n{c['title']}\n{c['url']}")
             cur.execute(
                 "UPDATE topics SET sent_23=1 WHERE section_key=? AND user_id=? AND url=?",
                 (section_key, user_id, c["url"]),
             )
+
         elif hours >= 22 and not sent_22:
             await notify(user_id, f"⚠️ Через 2 часа просрок ЖБ\n📂 {section_name}\n\n{c['title']}\n{c['url']}")
             cur.execute(
@@ -451,21 +533,44 @@ async def check_section_for_user(user_id, section_key):
     conn.close()
 
 
-async def check_all_users():
+def unique_checks():
+    pairs = []
+    seen = set()
+
     for user_id, sections in USER_SECTIONS.items():
         for section_key in sections:
-            try:
-                await check_section_for_user(user_id, section_key)
-            except Exception as e:
-                logging.exception("Auto check error user=%s section=%s: %s", user_id, section_key, e)
+            key = (user_id, section_key)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            pairs.append(key)
+
+    return pairs
+
+
+async def check_all_users():
+    for user_id, section_key in unique_checks():
+        try:
+            await check_section_for_user(user_id, section_key)
+        except Exception as e:
+            logging.exception("Auto check error user=%s section=%s: %s", user_id, section_key, e)
+
+        gc.collect()
+        await asyncio.sleep(SECTION_DELAY_SECONDS)
 
 
 async def checker_loop():
+    await asyncio.sleep(20)
+
     while True:
         try:
             await check_all_users()
         except Exception as e:
             logging.exception("Checker loop error: %s", e)
+
+        gc.collect()
         await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 
@@ -481,6 +586,7 @@ async def commands(message: types.Message):
             "/check — выбрать раздел и проверить\n"
             "/list — выбрать раздел и посмотреть время\n"
             "/debug — выбрать раздел и проверить видимость тем\n"
+            "/scan — то же самое, что /debug\n"
             "/mysections — мои авто-разделы\n"
             "/id — узнать свой ID"
         )
@@ -497,9 +603,11 @@ async def commands(message: types.Message):
     if text == "/mysections":
         user_id = message.chat.id
         sections = USER_SECTIONS.get(user_id, [])
+
         if not sections:
             await message.answer("За тобой пока не закреплены авто-разделы.")
             return
+
         names = [SECTIONS[s]["name"] for s in sections if s in SECTIONS]
         await message.answer("Твои авто-разделы:\n" + "\n".join(f"- {n}" for n in names))
         return
@@ -538,6 +646,7 @@ async def callbacks(call: CallbackQuery):
             return
 
         msg = f"Debug: вижу тем: {len(topics)}, в работе: {len(complaints)}\n"
+
         for t in topics[:10]:
             msg += f"\n- {t['title']}\n{t['url']}\n"
 
