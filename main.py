@@ -375,31 +375,17 @@ async def collect_complaints_async(section_key):
             except Exception as e:
                 logging.exception("Forum page error: %s", e)
 
+        # LOW MEMORY MODE:
+        # Не открываем каждую тему отдельно, чтобы Render Free не падал по памяти.
+        # Берём время и ссылку прямо со списка раздела.
         for t in list(seen.values())[:MAX_TOPICS]:
-            try:
-                html = await get_html(page, t["url"])
-                info = parse_topic_html(html, t["title"], t["url"])
-
-                if info:
-                    complaints.append(info)
-                elif t.get("created_at"):
-                    complaints.append({
-                        "title": t["title"],
-                        "url": t["url"],
-                        "base_time": t["created_at"],
-                        "from_admin": False,
-                    })
-
-            except Exception as e:
-                logging.exception("Topic error %s: %s", t.get("url"), e)
-
-                if t.get("created_at"):
-                    complaints.append({
-                        "title": t["title"],
-                        "url": t["url"],
-                        "base_time": t["created_at"],
-                        "from_admin": False,
-                    })
+            if t.get("created_at"):
+                complaints.append({
+                    "title": t["title"],
+                    "url": t["url"],
+                    "base_time": t["created_at"],
+                    "from_admin": False,
+                })
 
         try:
             await page.close()
