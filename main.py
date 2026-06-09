@@ -154,6 +154,9 @@ def parse_forum_html(html):
             url = "https://forum.radmir.games/" + href
 
         url = url.split("?")[0].rstrip("/")
+        thread_id_match = re.search(r"(\d+)$", url)
+        if thread_id_match:
+            url = "https://forum.radmir.games/threads/" + thread_id_match.group(1)
         created_at = parse_relative_time(text)
 
         topics[url] = {
@@ -189,6 +192,9 @@ def parse_forum_html(html):
                         url = "https://forum.radmir.games/" + href
 
                     url = url.split("?")[0].rstrip("/")
+                    thread_id_match = re.search(r"(\d+)$", url)
+                    if thread_id_match:
+                        url = "https://forum.radmir.games/threads/" + thread_id_match.group(1)
                     topics[url] = {
                         "title": title,
                         "url": url,
@@ -298,6 +304,13 @@ async def collect_complaints_async(debug=False):
                 info = parse_topic_html(html, t["title"], t["url"])
                 if info:
                     complaints.append(info)
+                elif t.get("created_at"):
+                    complaints.append({
+                        "title": t["title"],
+                        "url": t["url"],
+                        "base_time": t["created_at"],
+                        "from_admin": False,
+                    })
             except Exception as e:
                 logging.exception("Topic error %s: %s", t.get("url"), e)
 
@@ -400,7 +413,7 @@ async def commands(message: types.Message):
         await message.answer("\n".join(parts), disable_web_page_preview=True)
         return
 
-    if message.text == "/debug":
+    if message.text in ("/debug", "/scan"):
         await message.answer("Проверяю, какие темы вижу...")
         complaints, topics = await collect_complaints_async(debug=True)
 
