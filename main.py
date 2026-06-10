@@ -1,6 +1,5 @@
 import os
 import re
-import gc
 import sqlite3
 import asyncio
 import logging
@@ -14,12 +13,9 @@ from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
+CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
 PAGES_TO_CHECK = int(os.getenv("PAGES_TO_CHECK", "1"))
-MAX_TOPICS = int(os.getenv("MAX_TOPICS", "5"))
-
-# Пауза между проверками разделов, чтобы Render Free не умирал по памяти.
-SECTION_DELAY_SECONDS = int(os.getenv("SECTION_DELAY_SECONDS", "10"))
+MAX_TOPICS = int(os.getenv("MAX_TOPICS", "20"))
 
 CLOSED_PREFIXES = ("ОДОБРЕНО", "ОТКАЗАНО")
 
@@ -29,13 +25,9 @@ IGNORE_TITLE_PARTS = (
     "ИНФОРМАЦИЯ",
 )
 
-ADMIN_WORDS = (
-    "Администратор",
-    "Главный администратор",
-    "Зам. главного администратора",
-    "SERVER 06",
-)
+ADMIN_WORDS = ("Администратор", "Главный администратор", "Зам. главного администратора", "SERVER 06")
 
+# Разделы форума.
 SECTIONS = {
     "ne_sost": {
         "name": "ЖБ на не сост",
@@ -51,6 +43,8 @@ SECTIONS = {
     },
 }
 
+# Кому какие разделы присылать автоматически.
+# Тебе пока оставил все 3 раздела. Если хочешь только "не сост" — убери остальные ключи.
 USER_SECTIONS = {
     5952642946: ["ne_sost", "oprova_crime", "mafia_bands"],
     1819044320: ["oprova_crime", "mafia_bands"],
@@ -60,7 +54,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 DB_PATH = "bot.db"
-CHECK_LOCK = asyncio.Lock()
 
 
 def db():
@@ -112,11 +105,7 @@ def parse_relative_time(text):
         return d.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
 
     m = re.search(r"(\d{1,2})\s+([А-Яа-я]+)\s+(\d{4})(?:\s*в\s*(\d{1,2}):(\d{2}))?", text)
-    months = {
-        "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6,
-        "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12
-    }
-
+    months = {"янв":1,"фев":2,"мар":3,"апр":4,"мая":5,"май":5,"июн":6,"июл":7,"авг":8,"сен":9,"окт":10,"ноя":11,"дек":12}
     if m:
         day = int(m.group(1))
         mon_txt = m.group(2).lower()
@@ -144,10 +133,8 @@ def format_left(base_time):
 
 def forum_page_url(section_key, page_num):
     base_url = SECTIONS[section_key]["url"]
-
     if page_num <= 1:
         return base_url
-
     return base_url.rstrip("/") + f"/page-{page_num}"
 
 
@@ -165,13 +152,30 @@ async def get_html(page, url):
     except Exception:
         pass
 
+    # Форум иногда долго дорисовывает список тем, особенно на Render.
+    try:
+        await page.wait_for_selector(
+            ".structItem, .structItem--thread, a[href*='/threads/']",
+            timeout=30000
+        )
+    except Exception:
+        pass
+
+    # Небольшой скролл помогает XenForo догрузить элементы списка.
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1200)
+        await page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+
     await page.wait_for_timeout(2000)
 
-    for _ in range(3):
+    for _ in range(5):
         try:
             return await page.content()
         except Exception:
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
     return await page.content()
 
@@ -186,10 +190,8 @@ def make_absolute_url(href):
 
     url = url.split("?")[0].rstrip("/")
     m = re.search(r"(\d+)$", url)
-
     if m:
         return "https://forum.radmir.games/threads/" + m.group(1)
-
     return url
 
 
@@ -197,15 +199,20 @@ def parse_forum_html(html):
     soup = BeautifulSoup(html, "html.parser")
     topics = {}
 
-    for row in soup.select(".structItem--thread, .structItem"):
+    rows = soup.select(".structItem--thread, .structItem")
+
+    for row in rows:
         text = row.get_text(" ", strip=True)
         upper = text.upper()
 
         if any(p in upper for p in CLOSED_PREFIXES):
             continue
 
-        a = row.select_one('a[href*="/threads/"]')
-
+        # Сначала ищем именно ссылку заголовка темы.
+        a = (
+            row.select_one(".structItem-title a[href*='/threads/']") or
+            row.select_one("a[href*='/threads/']")
+        )
         if not a:
             continue
 
@@ -222,6 +229,7 @@ def parse_forum_html(html):
             "created_at": parse_relative_time(text),
         }
 
+    # Фолбэк: если форум отдал другую разметку, собираем по ссылкам.
     if not topics:
         for a in soup.select('a[href*="/threads/"]'):
             title = clean_title(a.get_text(" ", strip=True))
@@ -231,26 +239,25 @@ def parse_forum_html(html):
                 continue
 
             parent = a
-
-            for _ in range(8):
+            parent_text = ""
+            for _ in range(10):
                 parent = parent.parent
-
                 if not parent:
                     break
 
-                txt = parent.get_text(" ", strip=True)
-
-                if "Ответы:" in txt and "Просмотры:" in txt:
-                    if any(p in txt.upper() for p in CLOSED_PREFIXES):
-                        break
-
-                    url = make_absolute_url(href)
-                    topics[url] = {
-                        "title": title,
-                        "url": url,
-                        "created_at": parse_relative_time(txt),
-                    }
+                parent_text = parent.get_text(" ", strip=True)
+                if "Ответы:" in parent_text or "Просмотры:" in parent_text or "Обычные темы" in parent_text:
                     break
+
+            if parent_text and any(p in parent_text.upper() for p in CLOSED_PREFIXES):
+                continue
+
+            url = make_absolute_url(href)
+            topics[url] = {
+                "title": title,
+                "url": url,
+                "created_at": parse_relative_time(parent_text or title),
+            }
 
     return list(topics.values())[:MAX_TOPICS]
 
@@ -267,7 +274,6 @@ def is_admin_message(block):
 
 def message_time(block):
     time_el = block.select_one("time")
-
     if time_el:
         if time_el.get("data-time"):
             try:
@@ -276,7 +282,6 @@ def message_time(block):
                 pass
 
         dt = parse_relative_time(time_el.get_text(" ", strip=True))
-
         if dt:
             return dt
 
@@ -300,7 +305,6 @@ def parse_topic_html(html, fallback_title, url):
 
     for msg in soup.select("article.message, .message"):
         dt = message_time(msg)
-
         if dt:
             all_times.append(dt)
 
@@ -330,74 +334,67 @@ async def collect_complaints_async(section_key):
     complaints = []
     seen = {}
 
-    logging.info("Collect section started: %s", section_key)
-
-    playwright = await async_playwright().start()
-    browser = None
-
-    try:
-        browser = await playwright.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-default-apps",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
             ],
         )
 
-        page = await browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36",
-            locale="ru-RU",
-            viewport={"width": 1280, "height": 720},
-        )
-
-        for n in range(1, PAGES_TO_CHECK + 1):
-            try:
-                html = await get_html(page, forum_page_url(section_key, n))
-
-                for t in parse_forum_html(html):
-                    seen[t["url"]] = t
-
-            except Exception as e:
-                logging.exception("Forum page error: %s", e)
-
-        # Лёгкий режим: не открываем каждую тему, берём данные со списка раздела.
-        # Так Render Free не падает по памяти.
-        for t in list(seen.values())[:MAX_TOPICS]:
-            if t.get("created_at"):
-                complaints.append({
-                    "title": t["title"],
-                    "url": t["url"],
-                    "base_time": t["created_at"],
-                    "from_admin": False,
-                })
-
         try:
-            await page.close()
-        except Exception:
-            pass
+            page = await browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36",
+                locale="ru-RU",
+                viewport={"width": 1366, "height": 768},
+            )
 
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+            for n in range(1, PAGES_TO_CHECK + 1):
+                try:
+                    html = await get_html(page, forum_page_url(section_key, n))
+                    parsed = parse_forum_html(html)
+                    logging.info(
+                        "Parsed forum page: section=%s page=%s topics=%s",
+                        section_key,
+                        n,
+                        len(parsed)
+                    )
 
-        try:
-            await playwright.stop()
-        except Exception:
-            pass
+                    for t in parsed:
+                        seen[t["url"]] = t
+                except Exception as e:
+                    logging.exception("Forum page error: %s", e)
 
-        gc.collect()
+            for t in list(seen.values())[:MAX_TOPICS]:
+                try:
+                    html = await get_html(page, t["url"])
+                    info = parse_topic_html(html, t["title"], t["url"])
+                    if info:
+                        complaints.append(info)
+                    elif t.get("created_at"):
+                        complaints.append({
+                            "title": t["title"],
+                            "url": t["url"],
+                            "base_time": t["created_at"],
+                            "from_admin": False,
+                        })
+                except Exception as e:
+                    logging.exception("Topic error %s: %s", t.get("url"), e)
+                    if t.get("created_at"):
+                        complaints.append({
+                            "title": t["title"],
+                            "url": t["url"],
+                            "base_time": t["created_at"],
+                            "from_admin": False,
+                        })
+        finally:
+            await browser.close()
 
     complaints.sort(key=lambda x: x["base_time"])
-    logging.info("Collect section finished: %s, topics=%s, complaints=%s", section_key, len(seen), len(complaints))
     return complaints, list(seen.values())
 
 
@@ -408,10 +405,8 @@ def build_complaints_message(section_key, complaints):
         return f"📂 {section_name}\n\nЖалоб в рассмотрении не найдено."
 
     parts = [f"📂 {section_name}\n📋 Жалобы в рассмотрении:"]
-
     for i, c in enumerate(complaints[:20], start=1):
         source = "от последнего ответа админа" if c["from_admin"] else "от создания темы"
-
         parts.append(
             f"\n{i}. {c['title']}\n"
             f"{format_left(c['base_time'])}\n"
@@ -427,15 +422,8 @@ def build_complaints_message(section_key, complaints):
 
 def sections_keyboard(prefix):
     buttons = []
-
     for key, section in SECTIONS.items():
-        buttons.append([
-            InlineKeyboardButton(
-                text=section["name"],
-                callback_data=f"{prefix}:{key}",
-            )
-        ])
-
+        buttons.append([InlineKeyboardButton(text=section["name"], callback_data=f"{prefix}:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -456,8 +444,7 @@ async def check_section_for_user(user_id, section_key):
         base_iso = base_time.isoformat(timespec="seconds")
 
         cur.execute(
-            "SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics "
-            "WHERE section_key=? AND user_id=? AND url=?",
+            "SELECT last_base_time, sent_22, sent_23, sent_24 FROM topics WHERE section_key=? AND user_id=? AND url=?",
             (section_key, user_id, c["url"]),
         )
         row = cur.fetchone()
@@ -465,18 +452,15 @@ async def check_section_for_user(user_id, section_key):
         if not row:
             sent_22 = sent_23 = sent_24 = 0
             cur.execute(
-                "INSERT INTO topics(section_key,user_id,url,title,last_base_time,sent_22,sent_23,sent_24) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO topics(section_key,user_id,url,title,last_base_time,sent_22,sent_23,sent_24) VALUES(?,?,?,?,?,?,?,?)",
                 (section_key, user_id, c["url"], c["title"], base_iso, 0, 0, 0),
             )
         else:
             old_base, sent_22, sent_23, sent_24 = row
-
             if old_base != base_iso:
                 sent_22 = sent_23 = sent_24 = 0
                 cur.execute(
-                    "UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 "
-                    "WHERE section_key=? AND user_id=? AND url=?",
+                    "UPDATE topics SET title=?, last_base_time=?, sent_22=0, sent_23=0, sent_24=0 WHERE section_key=? AND user_id=? AND url=?",
                     (c["title"], base_iso, section_key, user_id, c["url"]),
                 )
 
@@ -489,14 +473,12 @@ async def check_section_for_user(user_id, section_key):
                 "UPDATE topics SET sent_24=1 WHERE section_key=? AND user_id=? AND url=?",
                 (section_key, user_id, c["url"]),
             )
-
         elif hours >= 23 and not sent_23:
             await notify(user_id, f"⚠️ Через 1 час просрок ЖБ\n📂 {section_name}\n\n{c['title']}\n{c['url']}")
             cur.execute(
                 "UPDATE topics SET sent_23=1 WHERE section_key=? AND user_id=? AND url=?",
                 (section_key, user_id, c["url"]),
             )
-
         elif hours >= 22 and not sent_22:
             await notify(user_id, f"⚠️ Через 2 часа просрок ЖБ\n📂 {section_name}\n\n{c['title']}\n{c['url']}")
             cur.execute(
@@ -509,49 +491,21 @@ async def check_section_for_user(user_id, section_key):
     conn.close()
 
 
-def unique_checks():
-    pairs = []
-    seen = set()
-
+async def check_all_users():
     for user_id, sections in USER_SECTIONS.items():
         for section_key in sections:
-            key = (user_id, section_key)
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-            pairs.append(key)
-
-    return pairs
-
-
-async def check_all_users():
-    for user_id, section_key in unique_checks():
-        try:
-            if CHECK_LOCK.locked():
-                logging.info("Skip auto check because manual/other check is running")
-                await asyncio.sleep(SECTION_DELAY_SECONDS)
-                continue
-            async with CHECK_LOCK:
+            try:
                 await check_section_for_user(user_id, section_key)
-        except Exception as e:
-            logging.exception("Auto check error user=%s section=%s: %s", user_id, section_key, e)
-
-        gc.collect()
-        await asyncio.sleep(SECTION_DELAY_SECONDS)
+            except Exception as e:
+                logging.exception("Auto check error user=%s section=%s: %s", user_id, section_key, e)
 
 
 async def checker_loop():
-    await asyncio.sleep(20)
-
     while True:
         try:
             await check_all_users()
         except Exception as e:
             logging.exception("Checker loop error: %s", e)
-
-        gc.collect()
         await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 
@@ -567,7 +521,6 @@ async def commands(message: types.Message):
             "/check — выбрать раздел и проверить\n"
             "/list — выбрать раздел и посмотреть время\n"
             "/debug — выбрать раздел и проверить видимость тем\n"
-            "/scan — то же самое, что /debug\n"
             "/mysections — мои авто-разделы\n"
             "/id — узнать свой ID"
         )
@@ -584,11 +537,9 @@ async def commands(message: types.Message):
     if text == "/mysections":
         user_id = message.chat.id
         sections = USER_SECTIONS.get(user_id, [])
-
         if not sections:
             await message.answer("За тобой пока не закреплены авто-разделы.")
             return
-
         names = [SECTIONS[s]["name"] for s in sections if s in SECTIONS]
         await message.answer("Твои авто-разделы:\n" + "\n".join(f"- {n}" for n in names))
         return
@@ -598,51 +549,50 @@ async def commands(message: types.Message):
         return
 
 
+
+async def safe_call_answer(call: CallbackQuery, text: str | None = None):
+    try:
+        if text:
+            await call.answer(text)
+        else:
+            await call.answer()
+    except Exception:
+        pass
+
 @dp.callback_query()
 async def callbacks(call: CallbackQuery):
     try:
         action, section_key = call.data.split(":", 1)
     except Exception:
-        await call.answer("Ошибка кнопки")
+        await safe_call_answer(call, "Ошибка кнопки")
         return
 
     if section_key not in SECTIONS:
-        await call.answer("Раздел не найден")
+        await safe_call_answer(call, "Раздел не найден")
         return
 
     if action == "list":
         await call.message.answer(f"Проверяю раздел: {SECTIONS[section_key]['name']}...")
-        if CHECK_LOCK.locked():
-            await call.message.answer("Подожди, уже идёт проверка другого раздела. Попробуй через 30-60 секунд.")
-            await call.answer()
-            return
-        async with CHECK_LOCK:
-            complaints, _ = await collect_complaints_async(section_key)
+        complaints, _ = await collect_complaints_async(section_key)
         await call.message.answer(build_complaints_message(section_key, complaints), disable_web_page_preview=True)
-        await call.answer()
+        await safe_call_answer(call)
         return
 
     if action == "debug":
         await call.message.answer(f"Debug раздела: {SECTIONS[section_key]['name']}...")
-        if CHECK_LOCK.locked():
-            await call.message.answer("Подожди, уже идёт проверка другого раздела. Попробуй через 30-60 секунд.")
-            await call.answer()
-            return
-        async with CHECK_LOCK:
-            complaints, topics = await collect_complaints_async(section_key)
+        complaints, topics = await collect_complaints_async(section_key)
 
         if not topics:
             await call.message.answer("Debug: тем не вижу. Возможно, форум долго грузится или блокирует Render.")
-            await call.answer()
+            await safe_call_answer(call)
             return
 
         msg = f"Debug: вижу тем: {len(topics)}, в работе: {len(complaints)}\n"
-
         for t in topics[:10]:
             msg += f"\n- {t['title']}\n{t['url']}\n"
 
         await call.message.answer(msg, disable_web_page_preview=True)
-        await call.answer()
+        await safe_call_answer(call)
         return
 
 
